@@ -1,4 +1,4 @@
-use std::{collections::HashMap, sync::Arc};
+use std::{collections::HashMap, sync::Arc, str::FromStr};
 
 use chrono::{Local, NaiveDateTime};
 use reqwest::{header::*, Client};
@@ -17,6 +17,7 @@ use crate::{
 pub struct SFAccount {
     pub(super) username: String,
     pub(super) pw_hash: String,
+    pub(super) openid_token: Option<String>,
     pub(super) session: AccountSession,
     pub(super) client: Client,
     pub(super) options: ConnectionOptions,
@@ -66,6 +67,7 @@ impl SFAccount {
         let mut tmp_self = Self {
             username,
             pw_hash,
+            openid_token: None,
             session: AccountSession {
                 uuid: Default::default(),
                 bearer_token: Default::default(),
@@ -76,6 +78,94 @@ impl SFAccount {
 
         tmp_self.refresh_login().await?;
         Ok(tmp_self)
+    }
+
+    pub async fn login_with_steam() -> Result<SFAccount, SFError> {
+        SFAccount::login_with_steam_with_options(Default::default()).await
+    }
+
+    pub async fn login_with_steam_with_options(
+        options: ConnectionOptions,
+    ) -> Result<SFAccount, SFError> {
+        let mut tmp_self = Self {
+            username: String::default(),
+            pw_hash: String::default(),
+            openid_token: None,
+            session: AccountSession {
+                uuid: Default::default(),
+                bearer_token: Default::default(),
+            },
+            client: reqwest_client(&options).ok_or(SFError::ConnectionError)?,
+            options,
+        };
+
+        let (url, id_str) = tmp_self.get_steam_sso_url().await?;
+        open::that(url.as_str()).unwrap();
+
+        let mut token: Option<String> = None;
+
+        while token.is_none() {
+            log::debug!("Waiting for Steam Login completion");
+            async_std::task::sleep(std::time::Duration::from_secs(2)).await;
+
+            if let Ok(res) = tmp_self
+                .send_api_request(
+                    &format!("json/sso/steamauth/check/{}", id_str),
+                    APIRequest::Get
+                ).await
+            {
+                let to_str = |d: &Value| d.as_str().map(|a| a.to_string());
+
+                let Some(token_str) = to_str(&res["id_token"]) else {
+                    return Err(SFError::ParsingError(
+                        "missing token value in api response",
+                        format!("{res:?}"),
+                    ));
+                };
+
+                token = Some(token_str);
+            }
+        }
+
+        tmp_self.openid_token = token.take();
+        tmp_self.refresh_login_steam().await?;
+        Ok(tmp_self)
+    }
+
+    /// Refreshes the session by logging in again with the stored credentials.
+    /// This can be used when the server removed our session either for being
+    /// connected too long, or the server was restarted/cache cleared and forgot us
+    pub async fn refresh_login_steam(&mut self) -> Result<(), SFError> {
+        let mut form_data = HashMap::new();
+        form_data.insert("token".to_string(), self.openid_token.as_ref().unwrap().clone());
+
+        let res = self
+            .send_api_request(
+                "json/login/sso/steamauth",
+                APIRequest::Post {
+                    parameters: vec![
+                        "client_id=i43nwwnmfc5tced4jtuk4auuygqghud2yopx",
+                        "auth_type=access_token",
+                    ],
+                    form_data,
+                },
+            )
+            .await?;
+
+        let to_str = |d: &Value| d.as_str().map(|a| a.to_string());
+        let (Some(bearer_token), Some(uuid)) = (
+            to_str(&res["token"]["access_token"]),
+            to_str(&res["account"]["uuid"]),
+        ) else {
+            return Err(SFError::ParsingError(
+                "missing auth value in api response",
+                format!("{res:?}"),
+            ));
+        };
+
+        self.session = AccountSession { uuid, bearer_token };
+
+        Ok(())
     }
 
     /// Refreshes the session by logging in again with the stored credentials.
@@ -152,6 +242,41 @@ impl SFAccount {
         }
 
         Ok(chars)
+    }
+
+    async fn get_steam_sso_url(
+        &self
+    ) -> Result<(Url, String), SFError> {
+        let res = self
+            .send_api_request(
+                "json/sso/steamauth",
+                APIRequest::Get
+            ).await?;
+
+        let to_str = |d: &Value| d.as_str().map(|a| a.to_string());
+
+        let Some(url_str) = to_str(&res["redirect"]) else {
+            return Err(SFError::ParsingError(
+                "missing redirect value in api response",
+                format!("{res:?}"),
+            ));
+        };
+
+        let Some(id_str) = to_str(&res["id"]) else {
+            return Err(SFError::ParsingError(
+                "missing id value in api response",
+                format!("{res:?}"),
+            ));
+        };
+
+        let Ok(url) = Url::from_str(&url_str) else {
+            return Err(SFError::ParsingError(
+                "invalid redirect value in api response",
+                format!("{res:?}"),
+            ));
+        };
+
+        Ok((url, id_str))
     }
 
     /// Send a request to the SSO server. The endoint will be "json/*". We try
